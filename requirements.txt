@@ -1,0 +1,13 @@
+python-telegram-bot[webhooks]==22.*
+python-dotenv
+openai
+gspread
+google-auth
+google-auth-oauthlib
+pypdf
+requests
+beautifulsoup4
+tzdata
+apscheduler
+psycopg2-binary
+google-api-python-client
