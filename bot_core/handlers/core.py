@@ -70,7 +70,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /start — скидаємо сесію, підтягуємо телефон, вітаємось, просимо номер.
     """
     reset_session(context)
-    schedule_session_expiry(update, context)
+    # БЕЗ тайм-ауту сесії
     ensure_dialog(context)
 
     user = update.effective_user
@@ -156,7 +156,7 @@ async def block_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Будь-які не-текстові повідомлення (крім контакту, голосових та фото,
     для яких є окремі хендлери).
     """
-    schedule_session_expiry(update, context)
+    # БЕЗ тайм-ауту
     await update.message.reply_text(
         "Будь ласка, надсилайте текстове повідомлення 💬.",
         reply_markup=bottom_keyboard(
@@ -171,7 +171,7 @@ async def on_manager_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Кнопка "Зв’язатись з менеджером".
     Створюємо подію в БД та Google Sheets.
     """
-    schedule_session_expiry(update, context)
+    # БЕЗ тайм-ауту
     ensure_dialog(context)
 
     user = update.effective_user
@@ -235,9 +235,7 @@ async def _answer_free_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Дякую! Запит прийнято. Менеджер зв'яжеться з вами найближчим часом.\n\n🔧 FRENDT."
     )
-    await send_long_reply(
-        update,
-        context,
+    await update.message.reply_text(
         text,
         reply_markup=bottom_keyboard(
             context,
@@ -258,7 +256,7 @@ async def handle_message(
     - працює як для звичайного тексту,
     - так і для голосових (через text_override з handlers/voice.py).
     """
-    schedule_session_expiry(update, context)
+    # БЕЗ тайм-ауту сесії
     ensure_dialog(context)
 
     # 1) Беремо текст:
@@ -291,35 +289,28 @@ async def handle_message(
     touch_session(context)
     lm = user_message.lower()
 
-    # ------- сервіс/кабелі: коментар + завершення медіа-кейсу -------
+    # ------- медіа-кейс: зберігаємо коментар і завершуємо по "готово" -------
     flow = context.user_data.get("flow")
+    done_variants = {
+        "готово",
+        "готово.",
+        "це все",
+        "це все.",
+        "все",
+        "все.",
+    }
+    normalized = lm.strip()
+
     if flow in ("service", "cable"):
-        media_case = context.user_data.get("media_case")
-        normalized = lm.strip()
-
-        done_variants = {
-            "готово",
-            "готово.",
-            "це все",
-            "це все.",
-            "все",
-            "все.",
-        }
-
-        # Якщо є активний кейс і юзер пише "готово" → закриваємо кейс
-        if media_case and normalized in done_variants:
-            comment_text = (context.user_data.get("media_comment") or "").strip()
-            await finalize_media_case(update, context, comment_text=comment_text)
-            context.user_data.pop("media_comment", None)
-            return
-
-        # Інакше сприймаємо текст як опис проблеми/коментар до кейсу
+        # усе, що НЕ "готово" – вважаємо описом проблеми
         if normalized not in done_variants:
-            prev = context.user_data.get("media_comment") or ""
-            if prev:
-                context.user_data["media_comment"] = prev + "\n" + user_message
-            else:
-                context.user_data["media_comment"] = user_message
+            context.user_data["media_comment"] = user_message
+
+    media_case = context.user_data.get("media_case")
+    if media_case and normalized in done_variants:
+        # finalize_media_case сама візьме media_comment із user_data
+        await finalize_media_case(update, context)
+        return
 
     # підтягуємо телефон із «постійної» таблиці, якщо ще не в user_data
     if not context.user_data.get("phone"):
@@ -329,19 +320,6 @@ async def handle_message(
             known = None
         if known:
             context.user_data["phone"] = known
-
-    # тайм-аут сесії
-    if session_expired(context):
-        reset_session(context)
-        await update.message.reply_text(
-            "⏳ Сесію завершено через 1 годину неактивності.\n"
-            f"Я ваш помічник {F_COMPANY}. Поділіться номером телефону, будь ласка:",
-            reply_markup=bottom_keyboard(
-                context,
-                tg_user_id=str(user.id),
-            ),
-        )
-        return
 
     # ===== STAFF MODE =====
     if context.user_data.get("staff_mode"):
@@ -450,19 +428,36 @@ async def handle_message(
                 kwargs["max_tokens"] = 1200
                 kwargs["temperature"] = 0.2
 
-            async with typing_during(update.effective_chat):
-                response = OPENAI_CLIENT.chat.completions.create(**kwargs)
+            raw = ""
+            # до 2 спроб отримати нормальний текст від моделі
+            for attempt in (1, 2):
+                async with typing_during(update.effective_chat):
+                    response = OPENAI_CLIENT.chat.completions.create(**kwargs)
 
-            logger.info("OpenAI KB model used: %s", response.model)
-            raw = response.choices[0].message.content or ""
-            logger.info("OpenAI RAW answer: %r", raw)
+                logger.info(
+                    "OpenAI KB model used: %s (attempt %d)",
+                    response.model,
+                    attempt,
+                )
+                raw = (response.choices[0].message.content or "").strip()
+                logger.info(
+                    "OpenAI KB RAW answer (attempt %d): %r",
+                    attempt,
+                    raw,
+                )
+
+                if raw:
+                    break  # є нормальна відповідь – виходимо з циклу
 
             gpt_text = clean_plain_text(raw).strip()
+
             if not gpt_text:
-                gpt_text = (
-                    "Вибачте, я не отримав зрозумілої текстової відповіді від моделі. "
-                    "Спробуйте, будь ласка, переформулювати запит простішими словами."
+                # Якщо після двох спроб тексту немає — даємо можливість
+                # коду піти в Web / Plain фолбеки.
+                logger.warning(
+                    "OpenAI KB empty answer after 2 attempts, falling back to web/plain."
                 )
+                raise RuntimeError("kb_empty_answer")
 
             await send_long_reply(
                 update,
@@ -478,6 +473,8 @@ async def handle_message(
             return
         except Exception as e:
             logger.error("OpenAI KB mode error: %s", e)
+            # НІЧОГО не шлемо користувачу тут.
+            # Даємо можливість піти далі в Web / Plain.
 
     # 2) Web fallback
     if USE_WEB:
@@ -563,9 +560,7 @@ async def handle_message(
                 "Спробуйте, будь ласка, переформулювати запит простішими словами."
             )
 
-        await send_long_reply(
-            update,
-            context,
+        await update.message.reply_text(
             gpt_text + "\n\n🔧 FRENDT.",
             reply_markup=bottom_keyboard(
                 context,

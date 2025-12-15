@@ -1,7 +1,8 @@
 # bot_core/gpt_helpers.py
 from typing import List, Dict, Any
 
-from .config import F_COMPANY, F_SITE, F_PHONE
+from .config import F_COMPANY, F_SITE, F_PHONE, OPENAI_CLIENT
+from .logging_setup import logger
 from .utils import clean_plain_text as _clean_plain_text
 
 
@@ -23,15 +24,14 @@ BASE_SYSTEM_PROMPT = f"""
 - Пиши просто й по-людськи, без зайвої канцелярщини.
 
 Стиль:
-- Відповідай РОЗГОРНУТО: зазвичай 2–4 абзаци, за складних тем — до 6–8 абзаців.
-- Якщо доречний список — роби структуровані списки (3–7 пунктів) із короткими поясненнями.
-- Додавай приклади, порівняння і практичні поради, щоб людині було реально зрозуміло, що робити.
-- Уникай порожньої «води» і повторів — краще більше змісту, ніж просто обʼєм тексту.
+- Коротко і по суті: зазвичай 3–6 речень.
+- Якщо доречний список — роби компактний список на 3–5 пунктів, не більше.
+- Уникай довгих вступів, теорії та повторів.
 
 Пріоритети:
 - Якщо питання про автопілоти, навігацію, RTK, агрохімічні дослідження, сервіс чи кабельні жгути —
   у першу чергу пропонуй рішення FRENDT:
-  автопілоти FRENDT, TerraNavix, Ag Leader (SteadySteer, SteerCommand Z2), мережу FarmRTK, сервіс FRENDT.
+  автопілоти FRENDT, TerraNaviX, Ag Leader (SteadySteer, SteerCommand Z2), мережу FarmRTK, сервіс FRENDT.
 - Не роби «огляд ринку». Пропонуй 1–2 конкретні варіанти під задачу клієнта, з коротким поясненням «чому саме це».
 
 Контакти:
@@ -53,7 +53,7 @@ BASE_STAFF_SYSTEM_PROMPT = """
 
 Мова й стиль:
 - Відповідай українською (технічні терміни можна англійською).
-- Будь конкретним, структурованим. Можна давати розгорнуті відповіді, але без води.
+- Будь конкретним, структурованим і лаконічним.
 
 Що дозволено:
 - Допомагати з текстами для клієнтів (скрипти дзвінків, повідомлення, листи, описи товарів і послуг).
@@ -86,8 +86,6 @@ def _build_section_hint(context) -> str:
             "Відповідай як універсальний асистент на будь-які теми, "
             "а не лише про агро чи продукти FRENDT.\n"
             "Не нав'язуй FRENDT, якщо користувач сам прямо про це не питає.\n"
-            "Стиль відповідей може бути розгорнутим: кілька абзаців, зі списками та прикладами, "
-            "якщо це допомагає краще пояснити відповідь.\n"
         )
 
     parts: List[str] = []
@@ -209,10 +207,10 @@ def build_messages_for_openai(
             "не дала прямого хіта."
         )
 
-    # Додатковий наголос на стилі: розгорнуто, але без «води»
+    # Додатковий наголос на лаконічності (дублюємо, щоб модель точно запам'ятала)
     system_lines.append(
-        "Відповідай розгорнуто: кілька абзаців зі структурою (або список + короткі пояснення). "
-        "Спершу дай ясну відповідь на запитання користувача, потім — деталі, приклади й практичні поради."
+        "Будь лаконічним: не більше кількох абзаців. Спершу дай відповідь по суті, "
+        "а лише потім — додаткові пояснення, якщо вони дійсно потрібні."
     )
 
     system_prompt = "\n\n".join(system_lines)
@@ -276,19 +274,18 @@ def build_messages_for_staff(context, user_message: str) -> List[Dict[str, Any]]
     section_hint = _build_section_hint(context)
     if section_hint:
         system_lines.append(
-            "Зараз співробітник працює в контексті певного розділу/сценарію бота. "
-            + section_hint
+            "Зараз співробітник працює в контексті певного розділу/сценарію бота. " + section_hint
         )
 
     # Трошки про стиль для staff
     system_lines.append(
         "Відповідай чітко і по суті. Якщо просили приклади текстів або скрипти — давай готові варіанти, "
-        "які можна одразу копіювати в бот чи месенджер. За потреби можеш дати розгорнуте пояснення."
+        "які можна одразу копіювати в бот чи месенджер."
     )
 
     system_prompt = "\n\n".join(system_lines)
 
-    messages: List[Dict, Any] = []
+    messages: List[Dict[str, Any]] = []
     messages.append({"role": "system", "content": system_prompt})
 
     # Історія для staff (можна трохи більше)
@@ -303,3 +300,61 @@ def build_messages_for_staff(context, user_message: str) -> List[Dict[str, Any]]
     messages.append({"role": "user", "content": user_message})
 
     return messages
+
+
+# ====== ЄДИНИЙ helper для виклику OpenAI з ретраями ======
+
+
+def openai_chat_with_retry(
+    kwargs: Dict[str, Any],
+    *,
+    label: str,
+    max_attempts: int = 2,
+) -> str:
+    """
+    Викликає OPENAI_CLIENT.chat.completions.create(**kwargs) з кількома спробами.
+    Повертає вже ОЧИЩЕНИЙ текст (clean_plain_text + strip) або порожній рядок,
+    якщо усі спроби дали порожню відповідь / помилку.
+
+    kwargs — це той самий dict, який раніше передавався в OPENAI_CLIENT.chat.completions.create.
+    """
+    if OPENAI_CLIENT is None:
+        logger.error("openai_chat_with_retry(%s): OPENAI_CLIENT is None", label)
+        return ""
+
+    last_clean = ""
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = OPENAI_CLIENT.chat.completions.create(**kwargs)
+        except Exception as e:
+            logger.error(
+                "OpenAI %s error on attempt %d: %s",
+                label,
+                attempt,
+                e,
+            )
+            continue
+
+        model_name = getattr(response, "model", kwargs.get("model", "unknown"))
+        raw = response.choices[0].message.content or ""
+        logger.info(
+            "OpenAI %s model used: %s (attempt %d)",
+            label,
+            model_name,
+            attempt,
+        )
+        logger.info("OpenAI %s RAW answer: %r", label, raw)
+
+        clean = clean_plain_text(raw).strip()
+        if clean:
+            return clean
+
+        logger.warning(
+            "OpenAI %s empty answer from model on attempt %d",
+            label,
+            attempt,
+        )
+        last_clean = clean
+
+    return last_clean
