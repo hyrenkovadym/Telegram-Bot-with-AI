@@ -67,15 +67,16 @@ class typing_during:
 # ========= командні хендлери =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /start — скидаємо сесію, підтягуємо телефон, вітаємось, просимо номер.
+    /start — скидаємо сесію, вітаємось.
+    Без обов'язкового запиту номера телефону.
     """
     reset_session(context)
-    # БЕЗ тайм-ауту сесії
+    schedule_session_expiry(update, context)
     ensure_dialog(context)
 
     user = update.effective_user
 
-    # спроба підвантажити телефон із постійної таблиці
+    # опціонально: тихо підтягуємо телефон з БД, щоб не втратити старі ліди
     try:
         known = db_get_known_phone_by_tg(str(user.id))
     except Exception as e:
@@ -87,17 +88,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     greeting = rf"Привіт, {user.mention_html()}! 👋 Я ваш ШІ-помічник {F_COMPANY}."
 
-    if context.user_data.get("phone"):
-        await update.message.reply_html(
-            greeting,
-            reply_markup=bottom_keyboard(context, tg_user_id=str(user.id)),
-        )
-    else:
-        await update.message.reply_html(
-            greeting
-            + "\nЩоб ми могли з вами зв’язатися, поділіться, будь ласка, своїм номером телефону:",
-            reply_markup=bottom_keyboard(context, tg_user_id=str(user.id)),
-        )
+    await update.message.reply_html(
+        greeting,
+        reply_markup=bottom_keyboard(context, tg_user_id=str(user.id)),
+    )
 
 
 async def cmd_reload_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -136,7 +130,6 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Просто імпортуємо utils та перебудовуємо
     from .. import utils as utils_mod
 
     idx = utils_mod.kb_build_or_load()
@@ -156,7 +149,7 @@ async def block_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Будь-які не-текстові повідомлення (крім контакту, голосових та фото,
     для яких є окремі хендлери).
     """
-    # БЕЗ тайм-ауту
+    schedule_session_expiry(update, context)
     await update.message.reply_text(
         "Будь ласка, надсилайте текстове повідомлення 💬.",
         reply_markup=bottom_keyboard(
@@ -171,12 +164,12 @@ async def on_manager_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Кнопка "Зв’язатись з менеджером".
     Створюємо подію в БД та Google Sheets.
     """
-    # БЕЗ тайм-ауту
+    schedule_session_expiry(update, context)
     ensure_dialog(context)
 
     user = update.effective_user
 
-    # підтягуємо телефон із БД, якщо його немає в user_data
+    # підтягуємо телефон із БД, якщо його немає в user_data (тихо)
     if not context.user_data.get("phone"):
         try:
             known = db_get_known_phone_by_tg(str(user.id))
@@ -185,20 +178,11 @@ async def on_manager_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if known:
             context.user_data["phone"] = known
 
-    if not context.user_data.get("phone"):
-        await update.message.reply_text(
-            "Щоб менеджер зміг з вами зв’язатися, будь ласка, спочатку поділіться своїм номером телефону.",
-            reply_markup=bottom_keyboard(
-                context,
-                tg_user_id=str(update.effective_user.id),
-            ),
-        )
-        return
-
+    # якщо телефону немає – все одно приймаємо заявку, просто без номера
     full_name = ((user.first_name or "") + " " + (user.last_name or "")).strip()
     phone = context.user_data.get("phone", "")
 
-    # запис у lead_messages
+    # запис у lead_messages (якщо БД є – запишеться, якщо ні – DummyConn залогить)
     try:
         db_save_first_message(
             phone=phone,
@@ -256,7 +240,7 @@ async def handle_message(
     - працює як для звичайного тексту,
     - так і для голосових (через text_override з handlers/voice.py).
     """
-    # БЕЗ тайм-ауту сесії
+    schedule_session_expiry(update, context)
     ensure_dialog(context)
 
     # 1) Беремо текст:
@@ -289,30 +273,41 @@ async def handle_message(
     touch_session(context)
     lm = user_message.lower()
 
-    # ------- медіа-кейс: зберігаємо коментар і завершуємо по "готово" -------
+    # ------- зберігаємо коментар для медіа-кейсу (service/cable) -------
     flow = context.user_data.get("flow")
-    done_variants = {
-        "готово",
-        "готово.",
-        "це все",
-        "це все.",
-        "все",
-        "все.",
-    }
-    normalized = lm.strip()
-
     if flow in ("service", "cable"):
-        # усе, що НЕ "готово" – вважаємо описом проблеми
-        if normalized not in done_variants:
+        # якщо це не фраза типу "готово"/"це все" – вважаємо описом проблеми
+        if "готово" not in lm and "це все" not in lm:
             context.user_data["media_comment"] = user_message
 
+    # ===== Завершення медіа-кейсу ("Готово" / "Це все") =====
     media_case = context.user_data.get("media_case")
-    if media_case and normalized in done_variants:
-        # finalize_media_case сама візьме media_comment із user_data
-        await finalize_media_case(update, context)
-        return
+    if media_case:
+        normalized = lm.strip()
+        done_variants = {
+            "готово",
+            "готово.",
+            "це все",
+            "це все.",
+            "все",
+            "все.",
+        }
 
-    # підтягуємо телефон із «постійної» таблиці, якщо ще не в user_data
+        if normalized in done_variants:
+            # пріоритет: явний comment_text у media_case,
+            # якщо його немає — беремо те, що зберегли в media_comment
+            comment_from_case = (media_case.get("comment_text") or "").strip()
+            if not comment_from_case:
+                comment_from_case = context.user_data.get("media_comment", "").strip()
+
+            await finalize_media_case(
+                update,
+                context,
+                comment_text=comment_from_case or None,
+            )
+            return
+
+    # підтягуємо телефон із «постійної» таблиці, якщо ще не в user_data (тихо)
     if not context.user_data.get("phone"):
         try:
             known = db_get_known_phone_by_tg(str(user.id))
@@ -320,6 +315,19 @@ async def handle_message(
             known = None
         if known:
             context.user_data["phone"] = known
+
+    # тайм-аут сесії: якщо сплив — скидаємо діалог, але БЕЗ запиту телефону
+    if session_expired(context):
+        reset_session(context)
+        await update.message.reply_text(
+            "⏳ Сесію завершено через тривалу неактивність.\n"
+            f"Я ваш помічник {F_COMPANY}. Можете продовжити діалог — просто напишіть запит.",
+            reply_markup=bottom_keyboard(
+                context,
+                tg_user_id=str(user.id),
+            ),
+        )
+        return
 
     # ===== STAFF MODE =====
     if context.user_data.get("staff_mode"):
@@ -358,22 +366,14 @@ async def handle_message(
             )
         return
 
-    # Якщо ще немає телефону — просимо
-    if not context.user_data.get("phone"):
-        maybe_phone = try_normalize_user_phone(user_message)
-        if maybe_phone:
-            await process_contact_submission(update, context, maybe_phone)
-            return
-        await update.message.reply_text(
-            "Щоб я міг допомогти швидше, будь ласка, поділіться номером телефону:",
-            reply_markup=bottom_keyboard(
-                context,
-                tg_user_id=str(update.effective_user.id),
-            ),
-        )
+    # Якщо користувач сам надіслав номер (рядком) — можемо обробити як контакт
+    # (але ми більше НЕ вимагаємо номер для роботи бота)
+    maybe_phone = try_normalize_user_phone(user_message)
+    if maybe_phone:
+        await process_contact_submission(update, context, maybe_phone)
         return
 
-    # Перше повідомлення → лід-стрічка
+    # Перше повідомлення → лід-стрічка (якщо БД / GSheets є)
     if not context.user_data.get("first_q_saved"):
         try:
             full_name = ((user.first_name or "") + " " + (user.last_name or "")).strip()
@@ -405,7 +405,7 @@ async def handle_message(
         await _answer_free_mode(update, context)
         return
 
-    # 1) KB
+    # ===== 1) KB-режим =====
     kb_hits = kb_retrieve_smart(user_message, k=6)
     if kb_hits:
         kb_context = pack_snippets(kb_hits)
@@ -417,46 +417,46 @@ async def handle_message(
                 kb_context=kb_context,
             )
 
-            kwargs = {
-                "model": MODEL_CHAT,
-                "messages": messages,
-            }
+            async def call_kb(attempt: int) -> str:
+                kwargs = {
+                    "model": MODEL_CHAT,
+                    "messages": messages,
+                }
+                # max tokens
+                if str(MODEL_CHAT).startswith("gpt-5"):
+                    kwargs["max_completion_tokens"] = 1200
+                else:
+                    kwargs["max_tokens"] = 1200
+                    kwargs["temperature"] = 0.2
 
-            if MODEL_CHAT.startswith("gpt-5"):
-                kwargs["max_completion_tokens"] = 1200
-            else:
-                kwargs["max_tokens"] = 1200
-                kwargs["temperature"] = 0.2
-
-            raw = ""
-            # до 2 спроб отримати нормальний текст від моделі
-            for attempt in (1, 2):
                 async with typing_during(update.effective_chat):
                     response = OPENAI_CLIENT.chat.completions.create(**kwargs)
 
                 logger.info(
-                    "OpenAI KB model used: %s (attempt %d)",
-                    response.model,
-                    attempt,
+                    "OpenAI KB model used: %s (attempt %d)", response.model, attempt
                 )
-                raw = (response.choices[0].message.content or "").strip()
+                raw = response.choices[0].message.content or ""
                 logger.info(
                     "OpenAI KB RAW answer (attempt %d): %r",
                     attempt,
                     raw,
                 )
+                return clean_plain_text(raw).strip()
 
-                if raw:
-                    break  # є нормальна відповідь – виходимо з циклу
-
-            gpt_text = clean_plain_text(raw).strip()
+            gpt_text = ""
+            for attempt in (1, 2):
+                gpt_text = await call_kb(attempt)
+                if gpt_text:
+                    break
+                logger.warning(
+                    "OpenAI KB empty answer from model on attempt %d", attempt
+                )
 
             if not gpt_text:
-                # Якщо після двох спроб тексту немає — даємо можливість
-                # коду піти в Web / Plain фолбеки.
                 logger.warning(
                     "OpenAI KB empty answer after 2 attempts, falling back to web/plain."
                 )
+                # спеціально кидаємо помилку, щоб перейти в web/plain
                 raise RuntimeError("kb_empty_answer")
 
             await send_long_reply(
@@ -473,10 +473,8 @@ async def handle_message(
             return
         except Exception as e:
             logger.error("OpenAI KB mode error: %s", e)
-            # НІЧОГО не шлемо користувачу тут.
-            # Даємо можливість піти далі в Web / Plain.
 
-    # 2) Web fallback
+    # ===== 2) Web fallback =====
     if USE_WEB:
         try:
             web_ctx = build_web_context(user_message)
@@ -487,29 +485,30 @@ async def handle_message(
                 web_context=web_ctx,
             )
 
-            kwargs = {
-                "model": MODEL_CHAT,
-                "messages": messages,
-            }
+            async def call_web() -> str:
+                kwargs = {
+                    "model": MODEL_CHAT,
+                    "messages": messages,
+                }
+                if str(MODEL_CHAT).startswith("gpt-5"):
+                    kwargs["max_completion_tokens"] = 900
+                else:
+                    kwargs["max_tokens"] = 900
+                    kwargs["temperature"] = 0.3
 
-            if MODEL_CHAT.startswith("gpt-5"):
-                kwargs["max_completion_tokens"] = 900
-            else:
-                kwargs["max_tokens"] = 900
-                kwargs["temperature"] = 0.3
+                async with typing_during(update.effective_chat):
+                    response = OPENAI_CLIENT.chat.completions.create(**kwargs)
 
-            async with typing_during(update.effective_chat):
-                response = OPENAI_CLIENT.chat.completions.create(**kwargs)
+                logger.info("OpenAI WEB model used: %s", response.model)
+                raw = response.choices[0].message.content or ""
+                logger.info("OpenAI WEB RAW answer: %r", raw)
+                return clean_plain_text(raw).strip()
 
-            logger.info("OpenAI WEB model used: %s", response.model)
-            raw = response.choices[0].message.content or ""
-            logger.info("OpenAI RAW answer: %r", raw)
-
-            gpt_text = clean_plain_text(raw).strip()
+            gpt_text = await call_web()
             if not gpt_text:
                 gpt_text = (
                     "Вибачте, я не отримав зрозумілої текстової відповіді від моделі. "
-                    "Спробуйте, будь ласка, переформулювати запит простішими словами."
+                    "Спробуйте переформулювати запит простішими словами."
                 )
 
             await send_long_reply(
@@ -527,7 +526,7 @@ async def handle_message(
         except Exception as e:
             logger.error("Web fallback error: %s", e)
 
-    # 3) Plain
+    # ===== 3) Plain-режим (без KB / Web) =====
     try:
         messages = build_messages_for_openai(
             context,
@@ -535,32 +534,56 @@ async def handle_message(
             last_user_text=user_message,
         )
 
-        kwargs = {
-            "model": MODEL_CHAT,
-            "messages": messages,
-        }
+        async def call_plain(attempt: int) -> str:
+            kwargs = {
+                "model": MODEL_CHAT,
+                "messages": messages,
+            }
+            if str(MODEL_CHAT).startswith("gpt-5"):
+                kwargs["max_completion_tokens"] = 900
+            else:
+                kwargs["max_tokens"] = 900
+                kwargs["temperature"] = 0.3
 
-        if MODEL_CHAT.startswith("gpt-5"):
-            kwargs["max_completion_tokens"] = 900
-        else:
-            kwargs["max_tokens"] = 900
-            kwargs["temperature"] = 0.3
+            async with typing_during(update.effective_chat):
+                response = OPENAI_CLIENT.chat.completions.create(**kwargs)
 
-        async with typing_during(update.effective_chat):
-            response = OPENAI_CLIENT.chat.completions.create(**kwargs)
+            logger.info(
+                "OpenAI PLAIN model used: %s (attempt %d)", response.model, attempt
+            )
+            raw = response.choices[0].message.content or ""
+            logger.info(
+                "OpenAI PLAIN RAW answer: %r",
+                raw,
+            )
+            return clean_plain_text(raw).strip()
 
-        logger.info("OpenAI PLAIN model used: %s", response.model)
-        raw = response.choices[0].message.content or ""
-        logger.info("OpenAI RAW answer: %r", raw)
-
-        gpt_text = clean_plain_text(raw).strip()
-        if not gpt_text:
-            gpt_text = (
-                "Вибачте, я не отримав зрозумілої текстової відповіді від моделі. "
-                "Спробуйте, будь ласка, переформулювати запит простішими словами."
+        gpt_text = ""
+        for attempt in (1, 2):
+            gpt_text = await call_plain(attempt)
+            if gpt_text:
+                break
+            logger.warning(
+                "OpenAI PLAIN empty answer from model on attempt %d", attempt
             )
 
-        await update.message.reply_text(
+        if not gpt_text:
+            logger.warning(
+                "OpenAI PLAIN empty answer after 2 attempts, showing stub to user."
+            )
+            await update.message.reply_text(
+                "Вибачте, я тимчасово не можу сформувати відповідь. "
+                "Спробуйте скоротити або спростити запит і надіслати ще раз.",
+                reply_markup=bottom_keyboard(
+                    context,
+                    tg_user_id=str(update.effective_user.id),
+                ),
+            )
+            return
+
+        await send_long_reply(
+            update,
+            context,
             gpt_text + "\n\n🔧 FRENDT.",
             reply_markup=bottom_keyboard(
                 context,

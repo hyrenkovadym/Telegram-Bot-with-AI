@@ -30,13 +30,16 @@ from .gsheets import gsheet_append_row, gsheet_append_event  # noqa: F401
 
 from .handlers.core import (
     cmd_start,
-    cmd_reload_blacklist,
-    cmd_last,
     cmd_model,
+    cmd_reload_blacklist,
     cmd_reload_kb,
-    on_manager_request,
-    block_non_text,
+    cmd_last,
+    cmd_phone_mode,   # NEW
+    cmd_set_model,    # NEW
+    cmd_admin_state,  # NEW
     handle_message,
+    block_non_text,
+    on_manager_request,
 )
 from .handlers.contact import on_contact, provide_contact
 from .handlers.menu import on_menu_button, on_menu_callback
@@ -126,6 +129,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("reload_kb", cmd_reload_kb))
+
+    # адмін-команди
+    app.add_handler(CommandHandler("phone_mode", cmd_phone_mode))
+    app.add_handler(CommandHandler("set_model", cmd_set_model))
+    app.add_handler(CommandHandler("admin_state", cmd_admin_state))
 
     # Контакт (поділитися номером)
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))

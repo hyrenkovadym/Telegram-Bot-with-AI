@@ -9,25 +9,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Telegram ID адмінів (рядки!)
+ADMIN_IDS = ["605086291"]
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-F_PHONE = os.getenv("SUPPORT_PHONE", "+380678120905").strip()
+F_PHONE = os.getenv("SUPPORT_PHONE", "+380674307870").strip()
 
 # ===== МОДЕЛІ =====
 # Базове значення, якщо в .env нічого не задано
-# (дешева модель за замовчуванням)
-MODEL_CHAT_DEFAULT = "gpt-5.1"
+MODEL_CHAT_DEFAULT = "gpt-4.1"
 
-# Модель для клієнтського режиму
+# Модель для клієнтського режиму:
+# - якщо OPENAI_CHAT_MODEL не задано в .env → буде gpt-4.1
+# - якщо задано, наприклад gpt-5.1 → використовуємо її
 MODEL_CHAT = (os.getenv("OPENAI_CHAT_MODEL", "") or MODEL_CHAT_DEFAULT).strip()
 
 # Модель для режиму співробітника:
-# за замовчуванням та ж, що й MODEL_CHAT,
-# але можна окремо задати через OPENAI_STAFF_MODEL
+# - якщо OPENAI_STAFF_MODEL не задано → така ж, як MODEL_CHAT
 MODEL_STAFF = (os.getenv("OPENAI_STAFF_MODEL", "") or MODEL_CHAT).strip()
 
+# Окрема модель для аналізу фото/кабелів:
+# якщо в .env немає OPENAI_CABLE_MODEL → за замовчуванням gpt-4o
+MODEL_CABLE = (os.getenv("OPENAI_CABLE_MODEL", "") or "gpt-4o").strip()
+
+# Чи дозволяти web-fallback (пошук по інтернету)
 USE_WEB = os.getenv("USE_WEB", "1") == "1"
 
+# Шлях до KB
 KB_DIR = os.getenv("KB_DIR", "kb")
 KB_INDEX_PATH = os.path.join(KB_DIR, os.getenv("KB_INDEX_PATH", "kb_index.json"))
 
@@ -60,7 +69,6 @@ GSHEET_PATH = "frendt-service.json"
 GSHEET_NAME = "FRENDT Leads"
 
 BLACKLIST_FILE = "blacklist_phones.txt"
-
 
 # ========= GOOGLE DRIVE =========
 
@@ -113,7 +121,6 @@ else:
 
     OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
 
-# ... внизу config.py
 
 def model_display_name(model_id: str) -> str:
     """
@@ -128,5 +135,7 @@ def model_display_name(model_id: str) -> str:
         "gpt-5-mini": "GPT-5 mini",
         "gpt-5.1-mini": "GPT-5.1 mini",
         "gpt-5.1": "GPT-5.1",
+        "gpt-5-2025-08-07": "GPT-5 (2025-08-07)",
+        "gpt-5.1-2025-11-13": "GPT-5.1 (2025-11-13)",
     }
     return mapping.get(model_id, model_id)
