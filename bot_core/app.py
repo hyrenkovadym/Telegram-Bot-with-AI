@@ -34,9 +34,6 @@ from .handlers.core import (
     cmd_reload_blacklist,
     cmd_reload_kb,
     cmd_last,
-    cmd_phone_mode,   # NEW
-    cmd_set_model,    # NEW
-    cmd_admin_state,  # NEW
     handle_message,
     block_non_text,
     on_manager_request,
@@ -81,13 +78,13 @@ def build_app() -> Application:
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Голосові та аудіо → в наш voice-handler
+    # Голосові та аудіо → voice-handler
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice_message))
 
-    # Фото (для сервісу та кабельної проводки)
+    # Фото (сервіс, кабелі)
     app.add_handler(MessageHandler(filters.PHOTO, on_photo_message))
 
-    # Кнопка "Зв’язатись з менеджером"
+    # "Зв’язатись з менеджером"
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(MANAGER_BTN)}$"),
@@ -95,7 +92,7 @@ def build_app() -> Application:
         )
     )
 
-    # Кнопка "Меню"
+    # "Меню"
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(MENU_BTN)}$"),
@@ -103,7 +100,7 @@ def build_app() -> Application:
         )
     )
 
-    # Кнопка "Режим співробітника"
+    # "Режим співробітника"
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(STAFF_BTN)}$"),
@@ -111,7 +108,7 @@ def build_app() -> Application:
         )
     )
 
-    # Кнопка "Назад" (вихід із режиму співробітника)
+    # "Назад" у режимі співробітника
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(BACK_BTN)}$"),
@@ -119,7 +116,7 @@ def build_app() -> Application:
         )
     )
 
-    # callback-и меню (8 пунктів + підменю)
+    # callback-и меню
     app.add_handler(CallbackQueryHandler(on_menu_callback, pattern=r"^menu:"))
 
     # Команди
@@ -130,15 +127,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("reload_kb", cmd_reload_kb))
 
-    # адмін-команди
-    app.add_handler(CommandHandler("phone_mode", cmd_phone_mode))
-    app.add_handler(CommandHandler("set_model", cmd_set_model))
-    app.add_handler(CommandHandler("admin_state", cmd_admin_state))
-
     # Контакт (поділитися номером)
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))
 
-    # Усі текстові повідомлення → в загальний handler
+    # Усі текстові повідомлення → загальний handler
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -146,7 +138,7 @@ def build_app() -> Application:
         )
     )
 
-    # Все інше не-текстове (документи, стікери тощо) → блокуємо
+    # Все інше (доки, стікери і т.д.) → блокуємо
     app.add_handler(
         MessageHandler(
             ~filters.TEXT
@@ -164,7 +156,7 @@ def build_app() -> Application:
 
 def run_webhook(app: Application):
     """
-    Запуск у режимі WEBHOOK (наприклад, на Cloud Run/Render/Fly.io).
+    Запуск у режимі WEBHOOK (Render/Cloud Run і т.п.).
     """
     if not WEBHOOK_BASE:
         raise RuntimeError(
@@ -185,7 +177,7 @@ def run_webhook(app: Application):
 
 def run_polling(app: Application):
     """
-    Запуск у режимі POLLING (локально / на простому VPS).
+    Запуск у режимі POLLING (локально / VPS).
     """
     logger.info("Старт у режимі POLLING.")
     print("✅ Бот запущений у режимі POLLING.")

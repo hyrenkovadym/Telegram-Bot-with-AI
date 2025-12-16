@@ -24,7 +24,7 @@ BASE_SYSTEM_PROMPT = f"""
 - Пиши просто й по-людськи, без зайвої канцелярщини.
 
 Стиль:
-- Коротко і по суті: зазвичай 3–6 речень.
+- Коротко і по-людськи: зазвичай 3–6 речень.
 - Якщо доречний список — роби компактний список на 3–5 пунктів, не більше.
 - Уникай довгих вступів, теорії та повторів.
 
@@ -305,11 +305,51 @@ def build_messages_for_staff(context, user_message: str) -> List[Dict[str, Any]]
 # ====== ЄДИНИЙ helper для виклику OpenAI з ретраями ======
 
 
+def _extract_text_from_choice(choice) -> str:
+    """
+    Акуратно дістаємо текст з choices[0].message:
+    - підтримує і старий формат (content: str),
+      і новий (content: list of parts),
+    - якщо тексту немає, але є refusal — повертаємо refusal.
+    """
+    msg = choice.message
+
+    raw = ""
+
+    # 1) content як рядок (старий формат)
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        raw = content
+
+    # 2) content як список частин (нові моделі)
+    elif isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            p_type = getattr(part, "type", None)
+            if p_type == "text":
+                parts.append(getattr(part, "text", "") or "")
+        raw = "\n".join(p.strip() for p in parts if p.strip())
+
+    # 3) якщо все ще порожньо, але є refusal — беремо його
+    if not raw:
+        refusal = getattr(msg, "refusal", None)
+        if isinstance(refusal, str) and refusal.strip():
+            raw = refusal.strip()
+
+        # іноді refusal може бути на рівні choice
+        if not raw:
+            refusal2 = getattr(choice, "refusal", None)
+            if isinstance(refusal2, str) and refusal2.strip():
+                raw = refusal2.strip()
+
+    return raw or ""
+
+
 def openai_chat_with_retry(
     kwargs: Dict[str, Any],
     *,
     label: str,
-    max_attempts: int = 2,
+    max_attempts: int = 1,
 ) -> str:
     """
     Викликає OPENAI_CLIENT.chat.completions.create(**kwargs) з кількома спробами.
@@ -317,6 +357,8 @@ def openai_chat_with_retry(
     якщо усі спроби дали порожню відповідь / помилку.
 
     kwargs — це той самий dict, який раніше передавався в OPENAI_CLIENT.chat.completions.create.
+    label — умовна назва (KB / PLAIN / STAFF) для логів.
+    max_attempts — скільки разів максимум пробуємо.
     """
     if OPENAI_CLIENT is None:
         logger.error("openai_chat_with_retry(%s): OPENAI_CLIENT is None", label)
@@ -358,3 +400,4 @@ def openai_chat_with_retry(
         last_clean = clean
 
     return last_clean
+

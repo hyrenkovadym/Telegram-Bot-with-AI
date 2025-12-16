@@ -2,9 +2,9 @@
 import asyncio
 from contextlib import suppress
 
-from telegram import Update
-from telegram.constants import ChatAction
+from telegram import Update, Message
 from telegram.ext import ContextTypes
+from telegram.constants import ChatAction
 
 from ..config import (
     F_COMPANY,
@@ -33,35 +33,12 @@ from ..utils import (
     build_web_context,
     send_long_reply,
 )
-from ..gpt_helpers import build_messages_for_openai, clean_plain_text
+from ..gpt_helpers import (
+    build_messages_for_openai,
+    openai_chat_with_retry,
+)
 from .contact import process_contact_submission
 from .staff import answer_staff_mode
-
-
-# ========= typing indicator =========
-async def _typing_loop(chat):
-    while True:
-        with suppress(Exception):
-            await chat.send_action(ChatAction.TYPING)
-        await asyncio.sleep(4)
-
-
-class typing_during:
-    def __init__(self, chat):
-        self.chat = chat
-        self._task = None
-
-    async def __aenter__(self):
-        self._task = asyncio.create_task(_typing_loop(self.chat))
-        with suppress(Exception):
-            await self.chat.send_action(ChatAction.TYPING)
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self._task:
-            self._task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._task
 
 
 # ========= командні хендлери =========
@@ -417,60 +394,43 @@ async def handle_message(
                 kb_context=kb_context,
             )
 
-            async def call_kb(attempt: int) -> str:
-                kwargs = {
-                    "model": MODEL_CHAT,
-                    "messages": messages,
-                }
-                # max tokens
-                if str(MODEL_CHAT).startswith("gpt-5"):
-                    kwargs["max_completion_tokens"] = 1200
-                else:
-                    kwargs["max_tokens"] = 1200
-                    kwargs["temperature"] = 0.2
+            kwargs = {
+                "model": MODEL_CHAT,
+                "messages": messages,
+            }
+            if str(MODEL_CHAT).startswith("gpt-5"):
+                kwargs["max_completion_tokens"] = 1200
+            else:
+                kwargs["max_tokens"] = 1200
+                kwargs["temperature"] = 0.2
 
-                async with typing_during(update.effective_chat):
-                    response = OPENAI_CLIENT.chat.completions.create(**kwargs)
-
-                logger.info(
-                    "OpenAI KB model used: %s (attempt %d)", response.model, attempt
-                )
-                raw = response.choices[0].message.content or ""
-                logger.info(
-                    "OpenAI KB RAW answer (attempt %d): %r",
-                    attempt,
-                    raw,
-                )
-                return clean_plain_text(raw).strip()
-
-            gpt_text = ""
-            for attempt in (1, 2):
-                gpt_text = await call_kb(attempt)
-                if gpt_text:
-                    break
-                logger.warning(
-                    "OpenAI KB empty answer from model on attempt %d", attempt
-                )
-
-            if not gpt_text:
-                logger.warning(
-                    "OpenAI KB empty answer after 2 attempts, falling back to web/plain."
-                )
-                # спеціально кидаємо помилку, щоб перейти в web/plain
-                raise RuntimeError("kb_empty_answer")
-
-            await send_long_reply(
+            gpt_text = await with_thinking_timer(
                 update,
                 context,
-                gpt_text + "\n\n🔧 FRENDT.",
-                reply_markup=bottom_keyboard(
-                    context,
-                    tg_user_id=str(update.effective_user.id),
+                asyncio.to_thread(
+                    openai_chat_with_retry,
+                    kwargs,
+                    label="KB",
+                    max_attempts=2,
                 ),
             )
 
-            add_history(context, "assistant", gpt_text)
-            return
+            if gpt_text:
+                await send_long_reply(
+                    update,
+                    context,
+                    gpt_text + "\n\n🔧 FRENDT.",
+                    reply_markup=bottom_keyboard(
+                        context,
+                        tg_user_id=str(update.effective_user.id),
+                    ),
+                )
+                add_history(context, "assistant", gpt_text)
+                return
+
+            logger.warning(
+                "OpenAI KB empty answer after retry, falling back to web/plain."
+            )
         except Exception as e:
             logger.error("OpenAI KB mode error: %s", e)
 
@@ -485,44 +445,41 @@ async def handle_message(
                 web_context=web_ctx,
             )
 
-            async def call_web() -> str:
-                kwargs = {
-                    "model": MODEL_CHAT,
-                    "messages": messages,
-                }
-                if str(MODEL_CHAT).startswith("gpt-5"):
-                    kwargs["max_completion_tokens"] = 900
-                else:
-                    kwargs["max_tokens"] = 900
-                    kwargs["temperature"] = 0.3
+            kwargs = {
+                "model": MODEL_CHAT,
+                "messages": messages,
+            }
+            if str(MODEL_CHAT).startswith("gpt-5"):
+                kwargs["max_completion_tokens"] = 900
+            else:
+                kwargs["max_tokens"] = 900
+                kwargs["temperature"] = 0.3
 
-                async with typing_during(update.effective_chat):
-                    response = OPENAI_CLIENT.chat.completions.create(**kwargs)
-
-                logger.info("OpenAI WEB model used: %s", response.model)
-                raw = response.choices[0].message.content or ""
-                logger.info("OpenAI WEB RAW answer: %r", raw)
-                return clean_plain_text(raw).strip()
-
-            gpt_text = await call_web()
-            if not gpt_text:
-                gpt_text = (
-                    "Вибачте, я не отримав зрозумілої текстової відповіді від моделі. "
-                    "Спробуйте переформулювати запит простішими словами."
-                )
-
-            await send_long_reply(
+            gpt_text = await with_thinking_timer(
                 update,
                 context,
-                gpt_text + "\n\n🔧 FRENDT.",
-                reply_markup=bottom_keyboard(
-                    context,
-                    tg_user_id=str(update.effective_user.id),
+                asyncio.to_thread(
+                    openai_chat_with_retry,
+                    kwargs,
+                    label="WEB",
+                    max_attempts=1,
                 ),
             )
 
-            add_history(context, "assistant", gpt_text)
-            return
+            if gpt_text:
+                await send_long_reply(
+                    update,
+                    context,
+                    gpt_text + "\n\n🔧 FRENDT.",
+                    reply_markup=bottom_keyboard(
+                        context,
+                        tg_user_id=str(update.effective_user.id),
+                    ),
+                )
+                add_history(context, "assistant", gpt_text)
+                return
+
+            logger.warning("OpenAI WEB empty answer, falling back to plain.")
         except Exception as e:
             logger.error("Web fallback error: %s", e)
 
@@ -534,42 +491,30 @@ async def handle_message(
             last_user_text=user_message,
         )
 
-        async def call_plain(attempt: int) -> str:
-            kwargs = {
-                "model": MODEL_CHAT,
-                "messages": messages,
-            }
-            if str(MODEL_CHAT).startswith("gpt-5"):
-                kwargs["max_completion_tokens"] = 900
-            else:
-                kwargs["max_tokens"] = 900
-                kwargs["temperature"] = 0.3
+        kwargs = {
+            "model": MODEL_CHAT,
+            "messages": messages,
+        }
+        if str(MODEL_CHAT).startswith("gpt-5"):
+            kwargs["max_completion_tokens"] = 900
+        else:
+            kwargs["max_tokens"] = 900
+            kwargs["temperature"] = 0.3
 
-            async with typing_during(update.effective_chat):
-                response = OPENAI_CLIENT.chat.completions.create(**kwargs)
-
-            logger.info(
-                "OpenAI PLAIN model used: %s (attempt %d)", response.model, attempt
-            )
-            raw = response.choices[0].message.content or ""
-            logger.info(
-                "OpenAI PLAIN RAW answer: %r",
-                raw,
-            )
-            return clean_plain_text(raw).strip()
-
-        gpt_text = ""
-        for attempt in (1, 2):
-            gpt_text = await call_plain(attempt)
-            if gpt_text:
-                break
-            logger.warning(
-                "OpenAI PLAIN empty answer from model on attempt %d", attempt
-            )
+        gpt_text = await with_thinking_timer(
+            update,
+            context,
+            asyncio.to_thread(
+                openai_chat_with_retry,
+                kwargs,
+                label="PLAIN",
+                max_attempts=2,
+            ),
+        )
 
         if not gpt_text:
             logger.warning(
-                "OpenAI PLAIN empty answer after 2 attempts, showing stub to user."
+                "OpenAI PLAIN empty answer after retry, showing stub to user."
             )
             await update.message.reply_text(
                 "Вибачте, я тимчасово не можу сформувати відповідь. "
@@ -601,3 +546,77 @@ async def handle_message(
                 tg_user_id=str(update.effective_user.id),
             ),
         )
+
+
+async def with_thinking_timer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    work_coro,
+) -> str:
+    """
+    Обгортає будь-який "довгий" асинхронний виклик (GPT),
+    показуючи користувачу таймер "Думаю… N с" і видаляючи його
+    після завершення.
+
+    work_coro — вже створений coroutine / task (наприклад, asyncio.to_thread(...)),
+    який ми await-имо всередині.
+    """
+    msg = update.effective_message  # type: ignore[assignment]
+    chat = update.effective_chat
+    stop_event = asyncio.Event()
+    timer_message: Message | None = None
+
+    async def timer_worker():
+        nonlocal timer_message
+
+        # невелика затримка, щоб не мигало, якщо відповідь приходить миттєво
+        await asyncio.sleep(2)
+        if stop_event.is_set():
+            return
+
+        seconds = 2
+        try:
+            timer_message = await msg.reply_text(f"⌛ Думаю… {seconds} с")
+        except Exception:
+            timer_message = None
+
+        # крутимося, поки не скажуть "стоп"
+        while not stop_event.is_set():
+            await asyncio.sleep(1)
+            seconds += 1
+
+            # паралельно періодично шлемо "typing", якщо є чат
+            if chat is not None:
+                with suppress(Exception):
+                    await chat.send_action(ChatAction.TYPING)
+
+            if not timer_message:
+                continue
+
+            try:
+                await timer_message.edit_text(f"⌛ Думаю… {seconds} с")
+            except Exception:
+                # якщо не вийшло оновити — мовчки ігноруємо
+                pass
+
+    # запускаємо таймер у фоні
+    timer_task = context.application.create_task(timer_worker())
+
+    try:
+        # чекаємо реального GPT-запиту
+        result = await work_coro
+    finally:
+        # сигнал таймеру "стоп"
+        stop_event.set()
+        try:
+            await timer_task
+        except Exception:
+            pass
+        # видаляємо таймерне повідомлення, якщо воно є
+        if timer_message:
+            try:
+                await timer_message.delete()
+            except Exception:
+                pass
+
+    return result
