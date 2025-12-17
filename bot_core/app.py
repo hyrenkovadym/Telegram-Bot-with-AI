@@ -1,6 +1,7 @@
 # bot_core/app.py
 import os
 import re
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,6 +20,7 @@ from .config import (
     MENU_BTN,
     STAFF_BTN,
     BACK_BTN,
+    choose_run_mode,
 )
 from .logging_setup import logger
 from . import utils as utils_mod
@@ -26,7 +28,6 @@ from .utils import reload_blacklist
 from .kb import kb_build_or_load
 
 from .db import db_init
-from .gsheets import gsheet_append_row, gsheet_append_event  # noqa: F401
 
 from .handlers.core import (
     cmd_start,
@@ -45,34 +46,7 @@ from .handlers.voice import on_voice_message
 from .handlers.media import on_photo_message
 
 
-def choose_run_mode() -> str:
-    """
-    Вибір режиму запуску:
-    - якщо RUN_MODE=polling → polling
-    - якщо RUN_MODE=webhook і є WEBHOOK_BASE → webhook
-    - якщо нічого не задано, але WEBHOOK_BASE порожній → polling
-    """
-    env_mode = (os.getenv("RUN_MODE", "") or "").strip().lower()
-    webhook_base = (os.getenv("WEBHOOK_BASE", "") or "").strip()
-    print(
-        f"[diag] RUN_MODE={env_mode or '∅'} "
-        f"WEBHOOK_BASE={'set' if webhook_base else '∅'} "
-        f"PORT={os.getenv('PORT', '∅')}"
-    )
-
-    if env_mode.startswith("poll"):
-        return "polling"
-    if env_mode.startswith("web") and webhook_base:
-        return "webhook"
-    if not webhook_base:
-        return "polling"
-    return "polling"
-
-
 def build_app() -> Application:
-    """
-    Створює та налаштовує Application з усіма хендлерами.
-    """
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN не заданий у .env")
 
@@ -81,10 +55,10 @@ def build_app() -> Application:
     # Голосові та аудіо → voice-handler
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice_message))
 
-    # Фото (сервіс, кабелі)
+    # Фото → photo-handler
     app.add_handler(MessageHandler(filters.PHOTO, on_photo_message))
 
-    # "Зв’язатись з менеджером"
+    # Кнопка "Зв’язатись з менеджером"
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(MANAGER_BTN)}$"),
@@ -92,7 +66,7 @@ def build_app() -> Application:
         )
     )
 
-    # "Меню"
+    # Кнопка "Меню"
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(MENU_BTN)}$"),
@@ -100,7 +74,7 @@ def build_app() -> Application:
         )
     )
 
-    # "Режим співробітника"
+    # Кнопка "Режим співробітника"
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(STAFF_BTN)}$"),
@@ -108,7 +82,7 @@ def build_app() -> Application:
         )
     )
 
-    # "Назад" у режимі співробітника
+    # Кнопка "Назад"
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(rf"^{re.escape(BACK_BTN)}$"),
@@ -127,18 +101,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("reload_kb", cmd_reload_kb))
 
-    # Контакт (поділитися номером)
+    # Контакт
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))
 
-    # Усі текстові повідомлення → загальний handler
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message,
-        )
-    )
+    # Усі текстові повідомлення → core handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Все інше (доки, стікери і т.д.) → блокуємо
+    # Все інше
     app.add_handler(
         MessageHandler(
             ~filters.TEXT
@@ -155,17 +124,10 @@ def build_app() -> Application:
 
 
 def run_webhook(app: Application):
-    """
-    Запуск у режимі WEBHOOK (Render/Cloud Run і т.п.).
-    """
     if not WEBHOOK_BASE:
-        raise RuntimeError(
-            "WEBHOOK_BASE не заданий (потрібен публічний URL сервісу)."
-        )
+        raise RuntimeError("WEBHOOK_BASE не заданий (потрібен публічний URL сервісу).")
 
-    print(
-        f"✅ Бот запущений у режимі WEBHOOK на PORT={PORT} PATH={WEBHOOK_PATH} BASE={WEBHOOK_BASE}"
-    )
+    print(f"✅ Бот запущений у режимі WEBHOOK на PORT={PORT} PATH={WEBHOOK_PATH} BASE={WEBHOOK_BASE}")
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
@@ -176,28 +138,18 @@ def run_webhook(app: Application):
 
 
 def run_polling(app: Application):
-    """
-    Запуск у режимі POLLING (локально / VPS).
-    """
     logger.info("Старт у режимі POLLING.")
     print("✅ Бот запущений у режимі POLLING.")
     app.run_polling()
 
 
 def main():
-    """
-    Точка входу:
-    - ініціалізація БД
-    - підвантаження blacklist
-    - побудова/завантаження KB
-    - перевірка Google Sheets
-    - старт бота у відповідному режимі
-    """
     db_init()
+
     count = reload_blacklist()
     logger.info("Blacklist loaded: %s numbers", count)
 
-    # KB — пишемо індекс в utils_mod._KB_INDEX
+    # KB
     try:
         idx = kb_build_or_load()
         utils_mod._KB_INDEX = idx
@@ -207,7 +159,6 @@ def main():
 
     # Попередження про Google Sheets JSON
     from .config import GSHEET_PATH, GSHEET_NAME
-
     if not os.path.exists(GSHEET_PATH):
         logger.warning(
             "[GSHEET] JSON файл не знайдено: %s. Надішліть сервісному e-mail доступ до '%s'.",
@@ -219,11 +170,7 @@ def main():
 
     mode = choose_run_mode()
     if mode == "webhook":
-        logger.info(
-            "Старт у режимі WEBHOOK на PORT=%s PATH=%s",
-            PORT,
-            WEBHOOK_PATH,
-        )
+        logger.info("Старт у режимі WEBHOOK на PORT=%s PATH=%s", PORT, WEBHOOK_PATH)
         run_webhook(app)
     else:
         run_polling(app)

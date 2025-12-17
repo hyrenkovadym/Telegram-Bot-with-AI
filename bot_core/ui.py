@@ -1,9 +1,9 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ContextTypes
 
-from .config import MANAGER_BTN, MENU_BTN, STAFF_BTN, BACK_BTN
+from .config import MANAGER_BTN, MENU_BTN, STAFF_BTN, BACK_BTN, ADMIN_IDS
 from .db import db_get_known_phone_by_tg
-from .utils import is_staff_phone   # ⬅️ ДОДАЛИ ІМПОРТ
+from .utils import is_staff_phone
 
 
 def main_menu_keyboard():
@@ -20,12 +20,13 @@ def bottom_keyboard(context: ContextTypes.DEFAULT_TYPE, tg_user_id: str | None =
     Динамічна нижня клавіатура:
 
     - Якщо staff_mode=True  → тільки [Назад]
-    - Якщо телефону ще немає → [Поділитись номером]
-    - Якщо телефон є, але меню ще не відкривали → [Меню] (+ [Режим співробітника], якщо це співробітник)
-    - Якщо телефон є і меню вже відкривали → [Зв’язатись з менеджером] (+ [Режим співробітника], якщо це співробітник)
+    - Якщо меню ще не відкривали → [Меню] (+ [Режим співробітника], якщо дозволено)
+    - Якщо меню вже відкривали → [Зв’язатись з менеджером] (+ [Режим співробітника], якщо дозволено)
+
+    ВАЖЛИВО: телефон НЕ вимагаємо взагалі (щоб після "сну" Render не просило контакт по новій).
     """
 
-    # 1) Якщо зараз увімкнутий режим співробітника — показуємо лише «Назад»
+    # 1) staff mode → лише Назад
     if context.user_data.get("staff_mode"):
         return ReplyKeyboardMarkup(
             [[BACK_BTN]],
@@ -34,7 +35,7 @@ def bottom_keyboard(context: ContextTypes.DEFAULT_TYPE, tg_user_id: str | None =
             selective=False,
         )
 
-    # 2) Підтягуємо телефон із БД, якщо треба
+    # 2) підтягнемо телефон з БД, якщо він колись був (не обов'язково)
     known_phone = None
     if tg_user_id:
         try:
@@ -45,33 +46,29 @@ def bottom_keyboard(context: ContextTypes.DEFAULT_TYPE, tg_user_id: str | None =
         if known_phone and not context.user_data.get("phone"):
             context.user_data["phone"] = known_phone
 
-    # поточний телефон користувача
     phone = context.user_data.get("phone") or known_phone
-    has_phone = bool(phone)
 
-    # 3) Якщо телефону ще немає — просимо поділитись
-    if not has_phone:
-        return ReplyKeyboardMarkup(
-            [[KeyboardButton("Поділитись номером", request_contact=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=False,
-            selective=False,
-        )
+    # 3) staff дозволений або по phone з файлу, або по tg id (ADMIN)
+    tg_int = None
+    try:
+        tg_int = int(tg_user_id) if tg_user_id else None
+    except Exception:
+        tg_int = None
 
-    # 4) Є телефон → визначаємо, чи це співробітник
-    staff_allowed = is_staff_phone(phone)
+    staff_allowed = False
+    if phone and is_staff_phone(phone):
+        staff_allowed = True
+    if tg_int is not None and tg_int in (ADMIN_IDS or []):
+        staff_allowed = True
 
     menu_shown = bool(context.user_data.get("menu_shown"))
     rows = []
 
     if not menu_shown:
-        # Телефон є, але меню ще не відкривали → спочатку «Меню»
         rows.append([MENU_BTN])
     else:
-        # Меню вже відкривали → «Менеджер»
         rows.append([MANAGER_BTN])
 
-    # Додаємо "Режим співробітника" тільки якщо номер зі списку staff
     if staff_allowed:
         rows.append([STAFF_BTN])
 

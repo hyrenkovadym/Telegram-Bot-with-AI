@@ -1,4 +1,5 @@
 # bot_core/handlers/staff.py
+import re
 from contextlib import suppress
 
 from telegram import Update, ReplyKeyboardMarkup
@@ -8,8 +9,10 @@ from telegram.ext import ContextTypes
 from ..config import (
     BACK_BTN,
     MODEL_STAFF,
+    MODEL_CHAT,
     FREE_MODE,
     OPENAI_CLIENT,
+    ADMIN_IDS,
 )
 from ..logging_setup import logger
 from ..ui import bottom_keyboard
@@ -17,7 +20,28 @@ from ..utils import add_history, is_staff_phone
 from ..gpt_helpers import build_messages_for_staff, clean_plain_text
 
 
-# ----- клавіатура режиму співробітника -----
+# Питання про "версію / модель / gpt"
+_VERSION_Q_RE = re.compile(
+    r"(яка|який)\s+(ти|в тебе)\s+верс(ія|iя)|"
+    r"яка\s+верс(ія|iя)|"
+    r"яка\s+модель|"
+    r"який\s+ти\s+gpt|"
+    r"\bgpt\b|"
+    r"openai.*модель|"
+    r"model\s*name|model\s*id",
+    re.IGNORECASE,
+)
+
+
+def _version_reply() -> str:
+    staff_model = (MODEL_STAFF or "").strip() or "невідомо"
+    chat_model = (MODEL_CHAT or "").strip() or "невідомо"
+    return (
+        f"Зараз я працюю на моделі: {staff_model}.\n"
+        f"У звичайному режимі бота використовується: {chat_model}.\n"
+    )
+
+
 def staff_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[BACK_BTN]],
@@ -27,7 +51,6 @@ def staff_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-# ----- індикатор набору тексту тільки для цього модуля -----
 async def _typing_loop(chat):
     import asyncio
     while True:
@@ -56,110 +79,81 @@ class typing_during:
                 await self._task
 
 
-# ----- вхід / вихід із режиму співробітника -----
 async def on_staff_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Увімкнути режим співробітника.
-    Доступ тільки для номерів, які проходять is_staff_phone().
+    Доступ:
+      - phone є в blacklist_phones.txt (is_staff_phone)
+      - або tg_user_id є в ADMIN_IDS
     """
     user = update.effective_user
     phone = context.user_data.get("phone", "")
 
-    if not phone or not is_staff_phone(phone):
-        # Не даємо увімкнути staff-режим, якщо номер не зі списку співробітників
+    is_admin = False
+    try:
+        is_admin = int(user.id) in (ADMIN_IDS or [])
+    except Exception:
+        is_admin = False
+
+    if not is_admin and (not phone or not is_staff_phone(phone)):
         await update.message.reply_text(
             "Режим співробітника доступний лише для співробітників FRENDT.",
-            reply_markup=bottom_keyboard(
-                context,
-                tg_user_id=str(user.id),
-            ),
+            reply_markup=bottom_keyboard(context, tg_user_id=str(user.id)),
         )
         return
 
     context.user_data["staff_mode"] = True
     await update.message.reply_text(
         "Режим співробітника увімкнено ✅\n"
-        "Тепер ви можете ставити як робочі, так і особисті запитання.\n"
-        "Ці повідомлення не потрапляють у лід-стрічку або Google Sheets.\n\n"
         "Щоб повернутися до звичайного режиму, натисніть «Назад».",
         reply_markup=staff_keyboard(),
     )
 
 
 async def on_staff_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Вийти з режиму співробітника.
-    """
+    user = update.effective_user
     context.user_data["staff_mode"] = False
     await update.message.reply_text(
-        "Повертаю вас у звичайний режим 👌",
-        reply_markup=bottom_keyboard(
-            context,
-            tg_user_id=str(update.effective_user.id),
-        ),
+        "Ок, повернув у звичайний режим.",
+        reply_markup=bottom_keyboard(context, tg_user_id=str(user.id)),
     )
 
 
-# ----- основна відповідь у staff-режимі -----
-async def answer_staff_mode(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_message: str,
-):
-    """
-    Відповідь у режимі співробітника:
-    - не пишемо в Google Sheets
-    - не створюємо ліди
-    - працюємо напряму з OpenAI
-    """
-    user = update.effective_user
-    add_history(context, "user", user_message)
-
-    # Якщо OpenAI недоступний
+async def answer_staff_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str):
     if FREE_MODE or OPENAI_CLIENT is None:
-        text = (
-            "Режим співробітника працює тільки з активним підключенням до OpenAI. "
-            "Зараз я можу лише зафіксувати ваш запит."
-        )
         await update.message.reply_text(
-            text,
+            "Staff-режим недоступний у FREE_MODE.",
             reply_markup=staff_keyboard(),
         )
-        add_history(context, "assistant", text)
         return
 
-    try:
-        messages = build_messages_for_staff(context, user_message)
+    # 1) Якщо питають про версію/модель — відповідаємо з ENV, не звертаємось до OpenAI
+    if _VERSION_Q_RE.search(user_message or ""):
+        text = _version_reply()
+        add_history(context, "user", user_message)
+        add_history(context, "assistant", text)
+        await update.message.reply_text(text, reply_markup=staff_keyboard())
+        return
 
-        kwargs = {
-            "model": MODEL_STAFF,
-            "messages": messages,
-        }
+    # 2) Звичайний staff-запит → OpenAI
+    add_history(context, "user", user_message)
 
-        # GPT-5.* → max_completion_tokens, без temperature
-        if MODEL_STAFF.startswith("gpt-5"):
-            kwargs["max_completion_tokens"] = 900
-        else:
-            kwargs["max_tokens"] = 600
-            kwargs["temperature"] = 0.3
+    messages = build_messages_for_staff(context, user_message)
+    kwargs = {
+        "model": MODEL_STAFF,
+        "messages": messages,
+    }
 
-        async with typing_during(update.effective_chat):
-            response = OPENAI_CLIENT.chat.completions.create(**kwargs)
+    chat = update.effective_chat
+    async with typing_during(chat):
+        try:
+            resp = OPENAI_CLIENT.chat.completions.create(**kwargs)
+            raw = (resp.choices[0].message.content or "") if resp and resp.choices else ""
+        except Exception as e:
+            logger.error("STAFF OpenAI error: %s", e)
+            raw = ""
 
-        gpt_text = clean_plain_text(
-            response.choices[0].message.content or ""
-        ).strip()
+    text = clean_plain_text(raw).strip() or "Не отримав відповідь від моделі."
+    add_history(context, "assistant", text)
 
-        await update.message.reply_text(
-            gpt_text,
-            reply_markup=staff_keyboard(),
-        )
-        add_history(context, "assistant", gpt_text)
-
-    except Exception as e:
-        logger.error("OpenAI staff mode error: %s", e)
-        await update.message.reply_text(
-            "Не вдалося отримати відповідь у режимі співробітника. "
-            "Спробуйте ще раз пізніше.",
-            reply_markup=staff_keyboard(),
-        )
+    await update.message.reply_text(text, reply_markup=staff_keyboard())

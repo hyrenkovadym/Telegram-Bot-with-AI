@@ -23,15 +23,19 @@ BASE_SYSTEM_PROMPT = f"""
 - Відповідай тільки українською.
 - Пиши просто й по-людськи, без зайвої канцелярщини.
 
-Стиль:
-- Коротко і по-людськи: зазвичай 3–6 речень.
-- Якщо доречний список — роби компактний список на 3–5 пунктів, не більше.
-- Уникай довгих вступів, теорії та повторів.
+Стиль відповіді (розгорнуто, але без води):
+- Спочатку 1–2 речення: короткий висновок/рішення.
+- Далі структуровано: 6–12 пунктів (маркерований список) з конкретикою:
+  що перевірити, що зробити, які дані уточнити, які ризики/обмеження.
+- Якщо є кілька варіантів — дай 2 варіанти максимум і поясни «коли який».
+- Якщо потрібні уточнення — задай 3–6 точних запитань наприкінці.
+- Не пиши загальних “порад”, не повторюй запит, не роби довгих вступів.
+- Обсяг зазвичай 120–250 слів (можна більше, якщо це сервіс/кабелі і потрібні кроки).
 
 Пріоритети:
-- Якщо питання про автопілоти, навігацію, RTK, агрохімічні дослідження, сервіс чи кабельні жгути —
+- Якщо питання про автопілоти, навігацію, RTK, агрохімію, сервіс чи кабельні жгути —
   у першу чергу пропонуй рішення FRENDT:
-  автопілоти FRENDT, TerraNaviX, Ag Leader (SteadySteer, SteerCommand Z2), мережу FarmRTK, сервіс FRENDT.
+  автопілоти TerraNavix, Hexagon, CHCNAV, Ag Leader (SteadySteer, SteerCommand Z2), мережу FarmRTK, сервіс FRENDT.
 - Не роби «огляд ринку». Пропонуй 1–2 конкретні варіанти під задачу клієнта, з коротким поясненням «чому саме це».
 
 Контакти:
@@ -48,6 +52,7 @@ BASE_SYSTEM_PROMPT = f"""
 """.strip()
 
 
+
 BASE_STAFF_SYSTEM_PROMPT = """
 Ти — внутрішній ШІ-помічник для співробітників компанії FRENDT.
 
@@ -61,10 +66,7 @@ BASE_STAFF_SYSTEM_PROMPT = """
 - Давати ідеї для маркетингу, сценаріїв бота, обробки лідів, внутрішніх процесів.
 - Допомагати з кодом, структурами проєктів, технічними документами.
 
-Обмеження:
-- Не розкривай конфіденційні дані клієнтів (імена, телефони, конкретні господарства), навіть якщо вони є в історії діалогу.
-- Не називай точні внутрішні версії моделей (GPT-4, GPT-5 тощо). Якщо питають — скажи, що ти мовна модель OpenAI,
-  налаштована під внутрішні задачі FRENDT.
+
 """.strip()
 
 
@@ -306,43 +308,48 @@ def build_messages_for_staff(context, user_message: str) -> List[Dict[str, Any]]
 
 
 def _extract_text_from_choice(choice) -> str:
-    """
-    Акуратно дістаємо текст з choices[0].message:
-    - підтримує і старий формат (content: str),
-      і новий (content: list of parts),
-    - якщо тексту немає, але є refusal — повертаємо refusal.
-    """
     msg = choice.message
-
     raw = ""
 
-    # 1) content як рядок (старий формат)
     content = getattr(msg, "content", None)
+
+    # 1) content як рядок
     if isinstance(content, str):
         raw = content
 
-    # 2) content як список частин (нові моделі)
+    # 2) content як список частин (parts)
     elif isinstance(content, list):
         parts: List[str] = []
         for part in content:
-            p_type = getattr(part, "type", None)
-            if p_type == "text":
-                parts.append(getattr(part, "text", "") or "")
-        raw = "\n".join(p.strip() for p in parts if p.strip())
+            # part може бути dict
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    t = (part.get("text") or "").strip()
+                    if t:
+                        parts.append(t)
+                continue
 
-    # 3) якщо все ще порожньо, але є refusal — беремо його
+            # або об'єкт
+            if getattr(part, "type", None) == "text":
+                t = (getattr(part, "text", "") or "").strip()
+                if t:
+                    parts.append(t)
+
+        raw = "\n".join(parts)
+
+    # 3) refusal fallback
     if not raw:
         refusal = getattr(msg, "refusal", None)
         if isinstance(refusal, str) and refusal.strip():
             raw = refusal.strip()
 
-        # іноді refusal може бути на рівні choice
         if not raw:
             refusal2 = getattr(choice, "refusal", None)
             if isinstance(refusal2, str) and refusal2.strip():
                 raw = refusal2.strip()
 
     return raw or ""
+
 
 
 def openai_chat_with_retry(
@@ -379,7 +386,7 @@ def openai_chat_with_retry(
             continue
 
         model_name = getattr(response, "model", kwargs.get("model", "unknown"))
-        raw = response.choices[0].message.content or ""
+        raw = _extract_text_from_choice(response.choices[0])
         logger.info(
             "OpenAI %s model used: %s (attempt %d)",
             label,

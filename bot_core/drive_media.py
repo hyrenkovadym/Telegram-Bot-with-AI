@@ -248,6 +248,34 @@ async def finalize_media_case(update, context, comment_text: str = ""):
     else:
         full_comment = base_comment
 
+    # ---- 1.1) AI-аналіз для кабельних кейсів (дописати в коментар для менеджера) ----
+    if flow == "cable":
+        try:
+            preview_images = case.get("preview_images") or []
+            if preview_images:
+                from .cable_ai import classify_cable_or_connector_from_photo
+
+                guess = await classify_cable_or_connector_from_photo(preview_images[0], flow="cable")
+                if guess:
+                    code = (guess.get("code") or "").strip()
+                    name = (guess.get("name") or "").strip()
+
+                    if code and name:
+                        ai_line = f"[CABLE-AI] Ймовірно: {code} | {name}"
+                    elif name:
+                        ai_line = f"[CABLE-AI] Ймовірно: {name}"
+                    else:
+                        ai_line = ""
+
+                    if ai_line:
+                        full_comment = (full_comment + "\n" + ai_line).strip()
+            else:
+                logger.info("[CABLE-AI] Немає preview_images у кейсі – пропускаю AI-аналіз.")
+        except Exception as e:
+            logger.error("[CABLE-AI] Error during cable AI classify: %s", e)
+
+
+
     try:
         gsheet_append_row_with_media(
             full_name=full_name,
