@@ -1,3 +1,4 @@
+# bot_core/kb.py
 import os
 import re
 import json
@@ -18,15 +19,17 @@ _KB_INDEX: Dict[str, Any] = {}
 def _chunk_text(txt: str, chunk_size: int = 900, overlap: int = 120) -> List[str]:
     txt = re.sub(r"[ \t]+", " ", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
-    chunks = []
+    chunks: List[str] = []
     i = 0
     while i < len(txt):
-        chunk = txt[i:i + chunk_size]
+        chunk = txt[i : i + chunk_size]
         if i + chunk_size < len(txt):
             j = chunk.rfind(". ")
             if j > 300:
                 chunk = chunk[: j + 1]
-        chunks.append(chunk.strip())
+        chunk = chunk.strip()
+        if chunk:
+            chunks.append(chunk)
         i += max(len(chunk) - overlap, 1)
     return [c for c in chunks if len(c) >= 120]
 
@@ -83,66 +86,95 @@ def _tokenize_query(q: str) -> List[str]:
     return tokens
 
 
+def _iter_kb_files() -> List[str]:
+    """
+    Рекурсивно повертає всі .txt/.pdf у KB_DIR (включно з підпапками).
+    """
+    out: List[str] = []
+    for root, _, files in os.walk(KB_DIR):
+        for fn in files:
+            if fn.lower().endswith((".txt", ".pdf")):
+                out.append(os.path.join(root, fn))
+    out.sort()
+    return out
+
+
+def _rel_source(path: str) -> str:
+    # зберігаємо "source" як шлях відносно KB_DIR (щоб було зрозуміло, з якого файлу)
+    try:
+        return os.path.relpath(path, KB_DIR).replace("\\", "/")
+    except Exception:
+        return os.path.basename(path)
+
+
 def kb_build_or_load() -> Dict[str, Any]:
     os.makedirs(KB_DIR, exist_ok=True)
 
     if FREE_MODE:
         logger.info("[KB] FREE_MODE: індексація без OpenAI (тільки текстовий пошук).")
 
+    # 1) Якщо індекс існує — перевіряємо, чи файли не змінилися
     if os.path.exists(KB_INDEX_PATH):
         try:
             with open(KB_INDEX_PATH, "r", encoding="utf-8") as f:
                 idx = json.load(f)
-            files_now = []
-            for fn in os.listdir(KB_DIR):
-                if fn.lower().endswith((".txt", ".pdf")):
-                    path = os.path.join(KB_DIR, fn)
-                    files_now.append({"path": path, "mtime": os.path.getmtime(path)})
+
+            files_now = [{"path": p, "mtime": os.path.getmtime(p)} for p in _iter_kb_files()]
             old = {(d["path"], round(d.get("mtime", 0), 6)) for d in idx.get("files", [])}
             cur = {(d["path"], round(d.get("mtime", 0), 6)) for d in files_now}
+
             if old == cur and idx.get("chunks"):
                 logger.info("[KB] Завантажено індекс: %s", KB_INDEX_PATH)
                 return idx
         except Exception as e:
             logger.warning("[KB] Неможливо прочитати індекс (%s). Перебудовую…", e)
 
-    pdf_paths = [os.path.join(KB_DIR, fn) for fn in os.listdir(KB_DIR) if fn.lower().endswith(".pdf")]
-    txt_paths = [os.path.join(KB_DIR, fn) for fn in os.listdir(KB_DIR) if fn.lower().endswith(".txt")]
+    # 2) Будуємо індекс з усіх файлів у kb/ (рекурсивно)
+    all_paths = _iter_kb_files()
+    txt_paths = [p for p in all_paths if p.lower().endswith(".txt")]
+    pdf_paths = [p for p in all_paths if p.lower().endswith(".pdf")]
 
-    all_chunks = []
+    all_chunks: List[Dict[str, Any]] = []
+
     for path in txt_paths:
         txt = _txt_to_text(path)
+        if not txt.strip():
+            continue
         for i, ch in enumerate(_chunk_text(txt)):
-            all_chunks.append({"text": ch, "source": os.path.basename(path), "i": i, "type": "txt"})
+            all_chunks.append(
+                {"text": ch, "source": _rel_source(path), "i": i, "type": "txt"}
+            )
 
     for path in pdf_paths:
         txt = _pdf_to_text(path)
-        if not txt:
+        if not txt.strip():
             continue
         for i, ch in enumerate(_chunk_text(txt)):
-            all_chunks.append({"text": ch, "source": os.path.basename(path), "i": i, "type": "pdf"})
+            all_chunks.append(
+                {"text": ch, "source": _rel_source(path), "i": i, "type": "pdf"}
+            )
 
     if not all_chunks:
         logger.warning("[KB] Порожній контент. Поклади .txt або .pdf у %s", KB_DIR)
         return {"model": "text-embedding-3-small", "files": [], "chunks": []}
 
+    # 3) Ембеддинги
     embeds = _embed_texts([c["text"] for c in all_chunks])
     for c, emb in zip(all_chunks, embeds):
         c["embedding"] = emb
 
-    files_meta = []
-    for fn in os.listdir(KB_DIR):
-        if fn.lower().endswith((".txt", ".pdf")):
-            p = os.path.join(KB_DIR, fn)
-            files_meta.append({"path": p, "mtime": os.path.getmtime(p)})
+    # 4) Метадані файлів для перевірки актуальності індексу
+    files_meta = [{"path": p, "mtime": os.path.getmtime(p)} for p in _iter_kb_files()]
 
     idx = {"model": "text-embedding-3-small", "files": files_meta, "chunks": all_chunks}
+
     try:
         with open(KB_INDEX_PATH, "w", encoding="utf-8") as f:
             json.dump(idx, f, ensure_ascii=False)
         logger.info("[KB] Побудовано індекс із %d фрагментів.", len(all_chunks))
     except Exception as e:
         logger.warning("[KB] Не вдалося зберегти індекс: %s", e)
+
     return idx
 
 
@@ -212,7 +244,7 @@ def kb_retrieve_smart(query: str, k: int = 6) -> List[Dict[str, Any]]:
 
 
 def pack_snippets(snips: List[Dict[str, Any]], max_chars: int = 5000) -> str:
-    out = []
+    out: List[str] = []
     total = 0
     for s in snips:
         tag = f"[{s['source']} • {s['i']}]"

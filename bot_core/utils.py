@@ -2,28 +2,26 @@
 import os
 import re
 import time
-import math
 import json
-from contextlib import suppress
+import math
 from typing import Set, Iterable, List, Dict, Any
-
-import openai
+from contextlib import suppress
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from .logging_setup import logger
 from .config import (
-    OPENAI_API_KEY,
-    FREE_MODE,
     KB_DIR,
     KB_INDEX_PATH,
+    OPENAI_CLIENT,
+    FREE_MODE,
     BLACKLIST_FILE,
     SESSION_TIMEOUT_SEC,
     USE_WEB,
     F_PHONE,
     F_SITE,
 )
-from .logging_setup import logger
 
 # ======== PDF reader ========
 try:
@@ -38,11 +36,6 @@ try:
 except Exception:
     requests = None
     BeautifulSoup = None
-
-# ======== OpenAI client for embeddings ========
-_EMBED_CLIENT = None
-if not FREE_MODE and OPENAI_API_KEY:
-    _EMBED_CLIENT = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ========= PHONE & TEXT UTILS =========
@@ -102,7 +95,6 @@ def contains_emoji(text: str) -> bool:
 
 
 # ========= BLACKLIST / STAFF NUMBERS =========
-# один спільний кеш для "спец"-номерів (у т.ч. співробітники)
 _BLACKLIST_NORMALIZED: Set[str] = set()
 
 
@@ -134,18 +126,11 @@ def reload_blacklist() -> int:
 
 
 def is_blacklisted(phone: str) -> bool:
-    """
-    Чи є номер у списку спец-номерів/blacklist.
-    """
     norm = normalize_phone(phone)
     return bool(norm) and (norm in _BLACKLIST_NORMALIZED)
 
 
 def is_staff_phone(phone: str) -> bool:
-    """
-    Номер співробітника: зараз прирівнюємо до номерів із blacklist_phones.txt.
-    Якщо захочеш — легко винесемо в окремий файл staff_phones.txt.
-    """
     norm = normalize_phone(phone)
     return bool(norm) and (norm in _BLACKLIST_NORMALIZED)
 
@@ -204,9 +189,6 @@ def last_user_message(context: ContextTypes.DEFAULT_TYPE) -> str | None:
 
 # ========= SESSION (JobQueue) =========
 def schedule_session_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Плануємо завершення сесії через SESSION_TIMEOUT_SEC.
-    """
     jq = context.job_queue
     if jq is None:
         logger.warning(
@@ -231,12 +213,8 @@ def schedule_session_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def end_session_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Викликається після тайм-ауту сесії.
-    Чистимо chat_data та відправляємо кілька службових повідомлень.
-    """
     chat_id = context.job.chat_id
-    from .ui import bottom_keyboard, main_menu_keyboard  # локальний імпорт щоб уникнути циклів
+    from .ui import bottom_keyboard, main_menu_keyboard
 
     try:
         await context.bot.send_message(
@@ -259,9 +237,7 @@ async def end_session_job(context: ContextTypes.DEFAULT_TYPE):
             reply_markup=bottom_keyboard(context, tg_user_id=str(chat_id)),
         )
     except Exception as e:
-        logger.warning(
-            "Не вдалося надіслати повідомлення про завершення сесії: %s", e
-        )
+        logger.warning("Не вдалося надіслати повідомлення про завершення сесії: %s", e)
 
     chat_data = context.application.chat_data.get(chat_id)
     if isinstance(chat_data, dict):
@@ -269,10 +245,13 @@ async def end_session_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========= KB BUILDING & SEARCH =========
+_KB_INDEX: Dict[str, Any] = {}
+
+
 def _chunk_text(txt: str, chunk_size: int = 900, overlap: int = 120) -> List[str]:
     txt = re.sub(r"[ \t]+", " ", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
-    chunks = []
+    chunks: List[str] = []
     i = 0
     while i < len(txt):
         chunk = txt[i : i + chunk_size]
@@ -280,7 +259,9 @@ def _chunk_text(txt: str, chunk_size: int = 900, overlap: int = 120) -> List[str
             j = chunk.rfind(". ")
             if j > 300:
                 chunk = chunk[: j + 1]
-        chunks.append(chunk.strip())
+        chunk = chunk.strip()
+        if chunk:
+            chunks.append(chunk)
         i += max(len(chunk) - overlap, 1)
     return [c for c in chunks if len(c) >= 120]
 
@@ -307,10 +288,9 @@ def _txt_to_text(path: str) -> str:
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
-    if FREE_MODE or _EMBED_CLIENT is None:
-        # у FREE_MODE ембеддинги не використовуємо
+    if FREE_MODE or OPENAI_CLIENT is None:
         return [[0.0] for _ in texts]
-    resp = _EMBED_CLIENT.embeddings.create(
+    resp = OPENAI_CLIENT.embeddings.create(
         model="text-embedding-3-small",
         input=texts,
     )
@@ -325,17 +305,8 @@ def _cosine(a: List[float], b: List[float]) -> float:
 
 
 def _tokenize_query(q: str) -> List[str]:
-    """
-    Розбиваємо запит на смислові токени:
-    - все до нижнього регістру
-    - залишаємо:
-        * усі числа
-        * слова від 4+ символів (укр/латиниця)
-        * латинські абревіатури типу RTK, GPS (3+ символи)
-    """
     q = q.lower()
     raw_tokens = re.findall(r"[a-zа-щьюяєіїґ0-9]+", q)
-
     tokens: List[str] = []
     for t in raw_tokens:
         if t.isdigit():
@@ -347,77 +318,73 @@ def _tokenize_query(q: str) -> List[str]:
     return tokens
 
 
+def _iter_kb_files() -> List[str]:
+    """
+    Рекурсивно повертає всі .txt/.pdf у KB_DIR (включно з підпапками).
+    """
+    out: List[str] = []
+    for root, _, files in os.walk(KB_DIR):
+        for fn in files:
+            if fn.lower().endswith((".txt", ".pdf")):
+                out.append(os.path.join(root, fn))
+    out.sort()
+    return out
+
+
+def _rel_source(path: str) -> str:
+    """
+    Коротка назва джерела для логів/KB: шлях відносно KB_DIR.
+    """
+    try:
+        return os.path.relpath(path, KB_DIR).replace("\\", "/")
+    except Exception:
+        return os.path.basename(path)
+
+
 def kb_build_or_load() -> Dict[str, Any]:
-    """
-    Будує або завантажує індекс бази знань із KB_DIR у KB_INDEX_PATH.
-    """
     os.makedirs(KB_DIR, exist_ok=True)
 
     if FREE_MODE:
         logger.info("[KB] FREE_MODE: індексація без OpenAI (тільки текстовий пошук).")
 
-    # пробуємо прочитати існуючий індекс
     if os.path.exists(KB_INDEX_PATH):
         try:
             with open(KB_INDEX_PATH, "r", encoding="utf-8") as f:
                 idx = json.load(f)
-            files_now = []
-            for fn in os.listdir(KB_DIR):
-                if fn.lower().endswith((".txt", ".pdf")):
-                    path = os.path.join(KB_DIR, fn)
-                    files_now.append(
-                        {"path": path, "mtime": os.path.getmtime(path)}
-                    )
-            old = {
-                (d["path"], round(d.get("mtime", 0), 6))
-                for d in idx.get("files", [])
-            }
-            cur = {
-                (d["path"], round(d.get("mtime", 0), 6))
-                for d in files_now
-            }
+
+            files_now = [{"path": p, "mtime": os.path.getmtime(p)} for p in _iter_kb_files()]
+
+            old = {(d["path"], round(d.get("mtime", 0), 6)) for d in idx.get("files", [])}
+            cur = {(d["path"], round(d.get("mtime", 0), 6)) for d in files_now}
+
             if old == cur and idx.get("chunks"):
                 logger.info("[KB] Завантажено індекс: %s", KB_INDEX_PATH)
                 return idx
         except Exception as e:
             logger.warning("[KB] Неможливо прочитати індекс (%s). Перебудовую…", e)
 
-    pdf_paths = [
-        os.path.join(KB_DIR, fn)
-        for fn in os.listdir(KB_DIR)
-        if fn.lower().endswith(".pdf")
-    ]
-    txt_paths = [
-        os.path.join(KB_DIR, fn)
-        for fn in os.listdir(KB_DIR)
-        if fn.lower().endswith(".txt")
-    ]
+    all_paths = _iter_kb_files()
+    txt_paths = [p for p in all_paths if p.lower().endswith(".txt")]
+    pdf_paths = [p for p in all_paths if p.lower().endswith(".pdf")]
 
     all_chunks: List[Dict[str, Any]] = []
+
     for path in txt_paths:
         txt = _txt_to_text(path)
+        if not txt.strip():
+            continue
         for i, ch in enumerate(_chunk_text(txt)):
             all_chunks.append(
-                {
-                    "text": ch,
-                    "source": os.path.basename(path),
-                    "i": i,
-                    "type": "txt",
-                }
+                {"text": ch, "source": _rel_source(path), "i": i, "type": "txt"}
             )
 
     for path in pdf_paths:
         txt = _pdf_to_text(path)
-        if not txt:
+        if not txt.strip():
             continue
         for i, ch in enumerate(_chunk_text(txt)):
             all_chunks.append(
-                {
-                    "text": ch,
-                    "source": os.path.basename(path),
-                    "i": i,
-                    "type": "pdf",
-                }
+                {"text": ch, "source": _rel_source(path), "i": i, "type": "pdf"}
             )
 
     if not all_chunks:
@@ -428,37 +395,31 @@ def kb_build_or_load() -> Dict[str, Any]:
     for c, emb in zip(all_chunks, embeds):
         c["embedding"] = emb
 
-    files_meta = []
-    for fn in os.listdir(KB_DIR):
-        if fn.lower().endswith((".txt", ".pdf")):
-            p = os.path.join(KB_DIR, fn)
-            files_meta.append({"path": p, "mtime": os.path.getmtime(p)})
+    files_meta = [{"path": p, "mtime": os.path.getmtime(p)} for p in _iter_kb_files()]
 
-    idx = {
-        "model": "text-embedding-3-small",
-        "files": files_meta,
-        "chunks": all_chunks,
-    }
+    idx = {"model": "text-embedding-3-small", "files": files_meta, "chunks": all_chunks}
+
     try:
         with open(KB_INDEX_PATH, "w", encoding="utf-8") as f:
             json.dump(idx, f, ensure_ascii=False)
         logger.info("[KB] Побудовано індекс із %d фрагментів.", len(all_chunks))
     except Exception as e:
         logger.warning("[KB] Не вдалося зберегти індекс: %s", e)
+
     return idx
 
 
-_KB_INDEX: Dict[str, Any] = {}
+def load_kb_index() -> Dict[str, Any]:
+    global _KB_INDEX
+    _KB_INDEX = kb_build_or_load()
+    return _KB_INDEX
+
+
+def get_kb_chunk_count() -> int:
+    return len(_KB_INDEX.get("chunks", []))
 
 
 def kb_retrieve_smart(query: str, k: int = 6) -> List[Dict[str, Any]]:
-    """
-    Розумний пошук по базі знань:
-    1) Спочатку ранжуємо фрагменти за кількістю збігів токенів.
-    2) Якщо є збіги — повертаємо топ-k + ще 1–2 фрагменти з найвищою семантичною
-       схожістю.
-    3) Якщо буквальних збігів немає — використовуємо тільки ембеддинги.
-    """
     if not _KB_INDEX or not _KB_INDEX.get("chunks"):
         return []
 
@@ -478,41 +439,42 @@ def kb_retrieve_smart(query: str, k: int = 6) -> List[Dict[str, Any]]:
         literal_scored.sort(key=lambda x: x[0], reverse=True)
         top_literal = [c for _, c in literal_scored[:k]]
 
-        # додаємо 1–2 найкращі семантичні збіги
-        try:
-            q_emb = _embed_texts([query])[0]
-        except Exception:
-            return top_literal
+        if not FREE_MODE and OPENAI_CLIENT is not None:
+            try:
+                q_emb = _embed_texts([query])[0]
+            except Exception:
+                return top_literal
 
-        scored_sem: List[tuple[float, Dict[str, Any]]] = []
-        for ch in chunks:
-            sim = _cosine(q_emb, ch.get("embedding", [0.0]))
-            scored_sem.append((sim, ch))
-        scored_sem.sort(key=lambda x: x[0], reverse=True)
+            scored_sem: List[tuple[float, Dict[str, Any]]] = []
+            for ch in chunks:
+                sim = _cosine(q_emb, ch["embedding"])
+                scored_sem.append((sim, ch))
+            scored_sem.sort(key=lambda x: x[0], reverse=True)
 
-        extra: List[Dict[str, Any]] = []
-        for _, ch in scored_sem:
-            if ch not in top_literal:
-                extra.append(ch)
-            if len(extra) >= 2:
-                break
+            extra: List[Dict[str, Any]] = []
+            for _, ch in scored_sem:
+                if ch not in top_literal:
+                    extra.append(ch)
+                if len(extra) >= 2:
+                    break
 
-        return top_literal + extra
+            return top_literal + extra
 
-    # якщо буквальних збігів немає — лише ембеддинги
+        return top_literal
+
+    if FREE_MODE or OPENAI_CLIENT is None:
+        return []
+
     q_emb = _embed_texts([query])[0]
-    scored_sem = []
+    scored_sem: List[tuple[float, Dict[str, Any]]] = []
     for ch in chunks:
-        sim = _cosine(q_emb, ch.get("embedding", [0.0]))
+        sim = _cosine(q_emb, ch["embedding"])
         scored_sem.append((sim, ch))
     scored_sem.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in scored_sem[:k]]
 
 
 def pack_snippets(snips: List[Dict[str, Any]], max_chars: int = 5000) -> str:
-    """
-    Пакує кілька фрагментів KB у один текстовий блок для системного повідомлення.
-    """
     out: List[str] = []
     total = 0
     for s in snips:
@@ -574,9 +536,6 @@ def extract_text_from_html(html: str, max_chars: int = 4000) -> str:
 
 
 def build_web_context(query: str, max_pages: int = 3) -> str:
-    """
-    Формує текстовий "контекст із вебу" для GPT на основі DuckDuckGo.
-    """
     if FREE_MODE or not USE_WEB:
         return ""
     urls = duckduckgo_search(query, n=max_pages)
@@ -592,10 +551,6 @@ def build_web_context(query: str, max_pages: int = 3) -> str:
 
 
 def clean_plain_text(s: str) -> str:
-    """
-    Прибирає Markdown-виділення (*...*, _..._, `...`) і зайві переводи рядків.
-    Використовується для очистки відповіді GPT перед відправкою в Telegram.
-    """
     if not s:
         return s
     s = re.sub(r"\*{1,3}([^*\n]+)\*{1,3}", r"\1", s)
@@ -603,6 +558,7 @@ def clean_plain_text(s: str) -> str:
     s = re.sub(r"`{1,3}", "", s)
     s = re.sub(r"\r\n", "\n", s).strip()
     return s
+
 
 # ========= LONG TELEGRAM MESSAGES =========
 async def send_long_reply(
@@ -612,12 +568,6 @@ async def send_long_reply(
     reply_markup=None,
     chunk_size: int = 3500,
 ):
-    """
-    Надсилає довге повідомлення в кілька меседжів, якщо воно перевищує ліміт.
-
-    - Корисно для відповідей GPT та сервісного AI, щоб не впиратися у ліміт Telegram (~4096 символів).
-    - Перша частина отримує reply_markup (клавіатуру), наступні — без неї.
-    """
     if not text:
         return
 
@@ -627,7 +577,6 @@ async def send_long_reply(
 
     parts: List[str] = []
     while len(s) > chunk_size:
-        # Прагнемо різати по "красивих" межах
         cut = s.rfind("\n\n", 0, chunk_size)
         if cut == -1:
             cut = s.rfind("\n", 0, chunk_size)
